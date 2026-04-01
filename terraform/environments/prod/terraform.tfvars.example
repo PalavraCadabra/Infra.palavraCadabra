@@ -1,0 +1,2 @@
+aws_region  = "sa-east-1"
+db_password = "CHANGE_ME_use_a_strong_password"
