@@ -2,6 +2,7 @@
 # Compute Module — palavraCadabra
 # =============================================================================
 # Provisions:
+#   - ECR Repository for API container images
 #   - ECS Cluster for Fargate tasks
 #   - ECS Task Definition for the FastAPI backend
 #   - ECS Service with desired count and deployment configuration
@@ -9,6 +10,8 @@
 #   - IAM roles for ECS task execution and task role
 #   - CloudWatch log group for container logs
 # =============================================================================
+
+# --- Variables ---
 
 variable "project" {
   description = "Project name for resource tagging"
@@ -21,6 +24,12 @@ variable "environment" {
   type        = string
 }
 
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
 variable "public_subnet_ids" {
   description = "List of public subnet IDs for the ALB"
   type        = list(string)
@@ -31,15 +40,14 @@ variable "private_subnet_ids" {
   type        = list(string)
 }
 
-variable "app_security_group_id" {
-  description = "Security group ID for the application tier"
+variable "alb_security_group_id" {
+  description = "Security group ID for the ALB"
   type        = string
 }
 
-variable "container_image" {
-  description = "Docker image URI for the API container"
+variable "ecs_security_group_id" {
+  description = "Security group ID for ECS tasks"
   type        = string
-  default     = "palavracadabra/api:latest"
 }
 
 variable "container_port" {
@@ -66,6 +74,58 @@ variable "memory" {
   default     = 512
 }
 
+variable "database_url" {
+  description = "PostgreSQL connection URL"
+  type        = string
+  sensitive   = true
+}
+
+variable "redis_url" {
+  description = "Redis connection URL"
+  type        = string
+  sensitive   = true
+}
+
+# --- Data Sources ---
+
+data "aws_caller_identity" "current" {}
+
+# --- ECR Repository ---
+
+resource "aws_ecr_repository" "api" {
+  name                 = "${var.project}/api"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Name = "${var.project}-api"
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "api" {
+  repository = aws_ecr_repository.api.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep last 10 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 10
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
+}
+
 # --- ECS Cluster ---
 
 resource "aws_ecs_cluster" "main" {
@@ -77,8 +137,7 @@ resource "aws_ecs_cluster" "main" {
   }
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-cluster"
   }
 }
 
@@ -89,8 +148,7 @@ resource "aws_cloudwatch_log_group" "api" {
   retention_in_days = 30
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-api-logs"
   }
 }
 
@@ -111,8 +169,7 @@ resource "aws_iam_role" "ecs_execution" {
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-ecs-execution"
   }
 }
 
@@ -126,9 +183,56 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role.json
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-ecs-task"
   }
+}
+
+# Task role policy: allow access to S3 assets, Polly, Bedrock, CloudWatch
+resource "aws_iam_role_policy" "ecs_task" {
+  name = "${var.project}-${var.environment}-ecs-task-policy"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket",
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.project}-${var.environment}-assets",
+          "arn:aws:s3:::${var.project}-${var.environment}-assets/*",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "polly:SynthesizeSpeech",
+          "polly:DescribeVoices",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cognito-idp:AdminGetUser",
+          "cognito-idp:AdminListGroupsForUser",
+        ]
+        Resource = "arn:aws:cognito-idp:${var.aws_region}:${data.aws_caller_identity.current.account_id}:userpool/*"
+      },
+    ]
+  })
 }
 
 # --- Task Definition ---
@@ -145,34 +249,48 @@ resource "aws_ecs_task_definition" "api" {
   container_definitions = jsonencode([
     {
       name      = "api"
-      image     = var.container_image
+      image     = "${aws_ecr_repository.api.repository_url}:latest"
       cpu       = var.cpu
       memory    = var.memory
       essential = true
+
       portMappings = [
         {
           containerPort = var.container_port
           protocol      = "tcp"
         }
       ]
+
+      environment = [
+        { name = "ENVIRONMENT", value = var.environment },
+        { name = "AWS_REGION", value = var.aws_region },
+        { name = "DATABASE_URL", value = var.database_url },
+        { name = "REDIS_URL", value = var.redis_url },
+      ]
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.api.name
-          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-region"        = var.aws_region
           "awslogs-stream-prefix" = "api"
         }
+      }
+
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health || exit 1"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
       }
     }
   ])
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-api-task"
   }
 }
-
-data "aws_region" "current" {}
 
 # --- ALB ---
 
@@ -180,12 +298,11 @@ resource "aws_lb" "api" {
   name               = "${var.project}-${var.environment}-alb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [var.app_security_group_id]
+  security_groups    = [var.alb_security_group_id]
   subnets            = var.public_subnet_ids
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-alb"
   }
 }
 
@@ -198,15 +315,16 @@ resource "aws_lb_target_group" "api" {
 
   health_check {
     path                = "/health"
+    port                = "traffic-port"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5
     interval            = 30
+    matcher             = "200"
   }
 
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-api-tg"
   }
 }
 
@@ -240,7 +358,7 @@ resource "aws_ecs_service" "api" {
 
   network_configuration {
     subnets          = var.private_subnet_ids
-    security_groups  = [var.app_security_group_id]
+    security_groups  = [var.ecs_security_group_id]
     assign_public_ip = false
   }
 
@@ -250,22 +368,44 @@ resource "aws_ecs_service" "api" {
     container_port   = var.container_port
   }
 
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
+
+  depends_on = [aws_lb_listener.http]
+
   tags = {
-    Project     = var.project
-    Environment = var.environment
+    Name = "${var.project}-${var.environment}-api-service"
   }
 }
 
 # --- Outputs ---
 
 output "cluster_id" {
-  value = aws_ecs_cluster.main.id
+  description = "ECS cluster ID"
+  value       = aws_ecs_cluster.main.id
+}
+
+output "cluster_name" {
+  description = "ECS cluster name"
+  value       = aws_ecs_cluster.main.name
 }
 
 output "alb_dns_name" {
-  value = aws_lb.api.dns_name
+  description = "ALB DNS name"
+  value       = aws_lb.api.dns_name
 }
 
 output "alb_arn" {
-  value = aws_lb.api.arn
+  description = "ALB ARN"
+  value       = aws_lb.api.arn
+}
+
+output "ecr_repository_url" {
+  description = "ECR repository URL for the API"
+  value       = aws_ecr_repository.api.repository_url
+}
+
+output "api_log_group" {
+  description = "CloudWatch log group for the API"
+  value       = aws_cloudwatch_log_group.api.name
 }

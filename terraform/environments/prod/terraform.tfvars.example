@@ -1,2 +1,12 @@
-aws_region  = "sa-east-1"
-db_password = "CHANGE_ME_use_a_strong_password"
+aws_region    = "us-east-1"
+project_name  = "palavracadabra"
+environment   = "prod"
+db_password   = "CHANGE_ME_use_a_strong_password"
+
+# Prod sizing
+db_instance_class = "db.t3.small"
+redis_node_type   = "cache.t3.small"
+api_cpu           = 512
+api_memory        = 1024
+api_desired_count = 2
+vpc_cidr          = "10.1.0.0/16"
