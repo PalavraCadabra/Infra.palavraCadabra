@@ -66,7 +66,7 @@ module "compute" {
   desired_count         = var.api_desired_count
   cpu                   = var.api_cpu
   memory                = var.api_memory
-  database_url          = "postgresql://${var.db_username}:${var.db_password}@${module.database.postgres_endpoint}/${var.project_name}"
+  database_url          = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${module.database.postgres_endpoint}/${var.project_name}"
   redis_url             = "redis://${module.database.redis_endpoint}:6379"
 }
 
